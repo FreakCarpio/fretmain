@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "https://app.base44.com/api/$1"
+    }
+  ]
+}
