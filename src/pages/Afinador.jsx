@@ -37,11 +37,16 @@ function detectarFrecuencia(buffer, sampleRate) {
   
   // Calcular RMS para detectar si hay señal suficiente
   let rms = 0;
+  let maxSample = 0;
   for (let i = 0; i < SIZE; i++) {
+    const absVal = Math.abs(buffer[i]);
     rms += buffer[i] * buffer[i];
+    if (absVal > maxSample) maxSample = absVal;
   }
   rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.01) return null;
+  
+  // Umbral adaptativo: más sensible para guitarra
+  if (rms < 0.005 || maxSample < 0.02) return null;
 
   // Calcular offset mínimo y máximo basado en rango de guitarra
   const minPeriod = Math.floor(sampleRate / MAX_FREQ_GUITARRA);
@@ -75,28 +80,30 @@ function detectarFrecuencia(buffer, sampleRate) {
   let bestPeriod = -1;
   let bestCorr = 0;
   
-  // Buscar en rango de periodos válidos
+  // Buscar en rango de periodos válidos - encontrar máximo global
   for (let i = minPeriod + 1; i < maxPeriod; i++) {
-    // Es un pico si es mayor que sus vecinos
     if (correlations[i] > correlations[i - 1] && 
         correlations[i] > correlations[i + 1] &&
-        correlations[i] > correlations[bestPeriod] &&
-        correlations[i] > 0.5) { // Umbral mínimo de correlación
+        correlations[i] > bestCorr &&
+        correlations[i] > 0.3) { // Umbral reducido para mayor sensibilidad
       bestCorr = correlations[i];
       bestPeriod = i;
     }
   }
 
   // Refinamiento parabólico para mayor precisión
-  if (bestPeriod > minPeriod && bestPeriod < maxPeriod) {
-    const y0 = correlations[bestPeriod - 1];
-    const y1 = correlations[bestPeriod];
-    const y2 = correlations[bestPeriod + 1];
-    const ajuste = (y2 - y0) / (2 * (2 * y1 - y0 - y2));
-    bestPeriod = bestPeriod + ajuste;
+  if (bestPeriod > minPeriod && bestPeriod < maxPeriod - 1) {
+    const y0 = correlations[bestPeriod - 1] || 0;
+    const y1 = correlations[bestPeriod] || 0;
+    const y2 = correlations[bestPeriod + 1] || 0;
+    const denom = 2 * (2 * y1 - y0 - y2);
+    if (Math.abs(denom) > 0.0001) {
+      const ajuste = (y2 - y0) / denom;
+      bestPeriod = bestPeriod + ajuste;
+    }
   }
 
-  if (bestPeriod > 0 && bestCorr > 0.5) {
+  if (bestPeriod > 0 && bestCorr > 0.3) {
     return sampleRate / bestPeriod;
   }
 
@@ -104,26 +111,32 @@ function detectarFrecuencia(buffer, sampleRate) {
 }
 
 /**
- * Suavizado temporal: promedia detecciones recientes con ponderación
+ * Suavizado temporal: promedia detecciones recientes con ponderación exponencial
  */
-function temporalSmoothing(frequencies, newFreq, maxHistory = 5) {
+function temporalSmoothing(frequencies, newFreq, maxHistory = 8) {
   if (!newFreq) {
-    // Si no hay nueva freq, devolver null si el buffer está vacío
-    return frequencies.length > 0 ? frequencies[frequencies.length - 1] : null;
+    return null;
   }
 
   const updated = [...frequencies, newFreq].slice(-maxHistory);
+  
+  if (updated.length === 0) return null;
+  
+  // Si solo tenemos 1-2 valores, devolver promedio simple
+  if (updated.length <= 2) {
+    return updated.reduce((a, b) => a + b, 0) / updated.length;
+  }
   
   // Promedio ponderado exponencial (más peso a recientes)
   let pesoTotal = 0;
   let sumaPonderada = 0;
   updated.forEach((freq, i) => {
-    const peso = Math.pow(0.7, updated.length - 1 - i);
+    const peso = Math.pow(0.6, updated.length - 1 - i);
     pesoTotal += peso;
     sumaPonderada += freq * peso;
   });
 
-  return pesoTotal > 0 ? sumaPonderada / pesoTotal : null;
+  return pesoTotal > 0 ? sumaPonderada / pesoTotal : newFreq;
 }
 
 /**
@@ -316,7 +329,7 @@ export default function Afinador() {
   const [notasDetectadas, setNotasDetectadas] = useState([]);
   const [acordeDetectado, setAcordeDetectado] = useState(null);
 
-  // Refs para audio
+  // Refs para audio - DECLARADAS PRIMERO
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const streamRef = useRef(null);
@@ -330,10 +343,14 @@ export default function Afinador() {
   const stableFreqRef = useRef(null);
   const consecutiveFramesRef = useRef(0);
 
-  // Throttle: mínimo 50ms entre actualizaciones de afinador
-  const THROTTLE_AFINADOR = 50;
-  // Throttle: mínimo 150ms entre actualizaciones de acordes
-  const THROTTLE_ACORDES = 150;
+  // Ref para control de loop - DECLARADAS AL INICIO
+  const isLoopRunningRef = useRef(false);
+  const loopActiveRef = useRef(false);
+
+  // Throttle: mínimo 30ms entre actualizaciones de afinador
+  const THROTTLE_AFINADOR = 30;
+  // Throttle: mínimo 100ms entre actualizaciones de acordes
+  const THROTTLE_ACORDES = 100;
 
   const iniciar = async () => {
     try {
@@ -341,40 +358,43 @@ export default function Afinador() {
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
-          autoGainControl: true,
+          autoGainControl: false,
+          latency: 0
         },
         video: false 
       });
       streamRef.current = stream;
       
-      // Reutilizar AudioContext existente o crear nuevo
-      let ctx = audioCtxRef.current;
-      if (!ctx || ctx.state === 'closed') {
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        audioCtxRef.current = ctx;
-      }
+      // Crear AudioContext limpio
+      const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+      audioCtxRef.current = ctx;
       
-      // Si estaba suspendido, reanudar
+      // Esperar a que esté listo
       if (ctx.state === 'suspended') {
         await ctx.resume();
       }
       
+      // Crear analyser
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 4096;
-      analyser.smoothingTimeConstant = 0.3;
+      analyser.smoothingTimeConstant = 0.2;
       analyserRef.current = analyser;
       
       const source = ctx.createMediaStreamSource(stream);
       source.connect(analyser);
       
-      // Resetear historial
+      // Resetear todo
       freqHistoryRef.current = [];
       chordHistoryRef.current = { chordHistory: [] };
       stableFreqRef.current = null;
       consecutiveFramesRef.current = 0;
+      lastUpdateRef.current = 0;
+      lastChordUpdateRef.current = 0;
+      isLoopRunningRef.current = false;
+      loopActiveRef.current = true;
       
       setActivo(true);
-      loop();
+      
     } catch (err) {
       console.error('Error al iniciar micrófono:', err);
       setActivo(false);
@@ -382,16 +402,18 @@ export default function Afinador() {
   };
 
   const detener = () => {
-    cancelAnimationFrame(rafRef.current);
+    // Detener refs primero
+    loopActiveRef.current = false;
+    isLoopRunningRef.current = false;
+    
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
     
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
-    }
-    
-    // No cerrar AudioContext para poder reutilizarlo
-    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-      // Mantener abierto para reutilización
     }
     
     setActivo(false);
@@ -400,8 +422,8 @@ export default function Afinador() {
     setCuerdaDetectada(null);
     setNotasDetectadas([]);
     setAcordeDetectado(null);
+    setConsejo('');
     
-    // Limpiar refs
     freqHistoryRef.current = [];
     chordHistoryRef.current = { chordHistory: [] };
     stableFreqRef.current = null;
@@ -409,6 +431,12 @@ export default function Afinador() {
   };
 
   const loop = useCallback(() => {
+    // Verificar si debemos seguir ejecutando
+    if (!loopActiveRef.current) {
+      isLoopRunningRef.current = false;
+      return;
+    }
+    
     const analyser = analyserRef.current;
     const ctx = audioCtxRef.current;
     
@@ -427,38 +455,28 @@ export default function Afinador() {
     if (ahora - lastUpdateRef.current >= THROTTLE_AFINADOR) {
       const rawFreq = detectarFrecuencia(buffer, sampleRate);
       
-      if (rawFreq) {
+      if (rawFreq && rawFreq >= MIN_FREQ_GUITARRA && rawFreq <= MAX_FREQ_GUITARRA) {
         consecutiveFramesRef.current++;
         
-        // Solo promediar si tenemos suficientes frames consecutivos
-        if (consecutiveFramesRef.current >= 2) {
-          const smoothedFreq = temporalSmoothing(
-            freqHistoryRef.current,
-            rawFreq,
-            5
-          );
-          
-          if (smoothedFreq) {
-            stableFreqRef.current = smoothedFreq;
-            
-            setFrecuencia(smoothedFreq);
-            const info = freqToNota(smoothedFreq);
-            setNotaInfo(info);
-            
-            if (info) {
-              const cuerda = encontrarCuerda(smoothedFreq);
-              setCuerdaDetectada(cuerda);
-            }
-          }
+        // Agregar al historial
+        freqHistoryRef.current = [...freqHistoryRef.current, rawFreq].slice(-6);
+        
+        // Suavizar
+        const smoothedFreq = temporalSmoothing(freqHistoryRef.current.slice(0, -1), rawFreq, 5);
+        const finalFreq = smoothedFreq || rawFreq;
+        
+        stableFreqRef.current = finalFreq;
+        
+        const info = freqToNota(finalFreq);
+        setFrecuencia(finalFreq);
+        setNotaInfo(info);
+        
+        if (info) {
+          const cuerda = encontrarCuerda(finalFreq);
+          setCuerdaDetectada(cuerda);
         }
       } else {
-        // Sin detección - decrementar contador
-        consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 2);
-        
-        // Mantener última frecuencia válida por un tiempo
-        if (stableFreqRef.current && consecutiveFramesRef.current === 0) {
-          // Ya no mostrar nada después de varios frames sin detección
-        }
+        consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 1);
       }
       
       lastUpdateRef.current = ahora;
@@ -477,9 +495,7 @@ export default function Afinador() {
         
         if (estableNotas) {
           const acorde = identificarAcorde(estableNotas);
-          if (acorde) {
-            setAcordeDetectado(acorde);
-          }
+          setAcordeDetectado(acorde);
         }
       } else {
         setAcordeDetectado(null);
@@ -493,21 +509,20 @@ export default function Afinador() {
 
   useEffect(() => {
     return () => {
-      cancelAnimationFrame(rafRef.current);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-      }
+      detener();
     };
   }, []);
 
-  // Iniciar/parar loop cuando cambia activo
+  // Control del loop
   useEffect(() => {
-    if (activo) {
+    if (activo && analyserRef.current) {
+      loopActiveRef.current = true;
+      isLoopRunningRef.current = true;
       rafRef.current = requestAnimationFrame(loop);
     } else {
-      cancelAnimationFrame(rafRef.current);
+      detener();
     }
-  }, [activo, loop]);
+  }, [activo]);
 
   const pedirConsejo = async () => {
     if (!notaInfo) return;
