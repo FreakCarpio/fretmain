@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
 import { Mic, MicOff, Music2, Loader2 } from 'lucide-react';
 
@@ -13,6 +13,10 @@ const CUERDAS_GUITARRA = [
   { nombre: 'E4', freq: 329.63, cuerda: '1ª' },
 ];
 
+// Rango de frecuencias guitarra: E2=82Hz a E4=330Hz
+const MIN_FREQ_GUITARRA = 70;
+const MAX_FREQ_GUITARRA = 400;
+
 // Acordes: mapa nota raíz → tipo → semitonos desde la raíz
 const CHORD_TEMPLATES = {
   'Mayor':   [0, 4, 7],
@@ -23,62 +27,261 @@ const CHORD_TEMPLATES = {
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
-function freqToNota(freq) {
-  if (!freq || freq < 20) return null;
-  const A4 = 440;
-  const semitonos = 12 * Math.log2(freq / A4);
-  const semIndex = Math.round(semitonos) + 69;
-  const nota = NOTAS[((semIndex % 12) + 12) % 12];
-  const octava = Math.floor(semIndex / 12) - 1;
-  const freqIdeal = A4 * Math.pow(2, (semIndex - 69) / 12);
-  const centsDiff = 1200 * Math.log2(freq / freqIdeal);
-  return { nota, octava, centsDiff, freqIdeal, semIndex };
-}
 
+/**
+ * Autocorrelation pitch detection con refinamiento parabólico
+ * Algoritmo robusto tipo GuitarTuna
+ */
 function detectarFrecuencia(buffer, sampleRate) {
   const SIZE = buffer.length;
-  const rms = Math.sqrt(buffer.reduce((s, v) => s + v * v, 0) / SIZE);
-  if (rms < 0.01) return null;
-  let bestOffset = -1, bestCorr = 0;
-  for (let offset = 20; offset < SIZE / 2; offset++) {
-    let corr = 0;
-    for (let i = 0; i < SIZE / 2; i++) corr += Math.abs(buffer[i] - buffer[i + offset]);
-    corr = 1 - corr / (SIZE / 2);
-    if (corr > bestCorr) { bestCorr = corr; bestOffset = offset; }
+  
+  // Calcular RMS para detectar si hay señal suficiente
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) {
+    rms += buffer[i] * buffer[i];
   }
-  if (bestCorr > 0.9 && bestOffset > 0) return sampleRate / bestOffset;
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.01) return null;
+
+  // Calcular offset mínimo y máximo basado en rango de guitarra
+  const minPeriod = Math.floor(sampleRate / MAX_FREQ_GUITARRA);
+  const maxPeriod = Math.floor(sampleRate / MIN_FREQ_GUITARRA);
+
+  // Autocorrelation con normalización
+  const correlations = new Float32Array(maxPeriod + 1);
+  
+  for (let lag = minPeriod; lag <= maxPeriod; lag++) {
+    let sum = 0;
+    let norm1 = 0;
+    let norm2 = 0;
+    const limit = SIZE - lag;
+    
+    for (let i = 0; i < limit; i++) {
+      const val1 = buffer[i];
+      const val2 = buffer[i + lag];
+      sum += val1 * val2;
+      norm1 += val1 * val1;
+      norm2 += val2 * val2;
+    }
+    
+    // Normalización para evitar sesgo hacia frecuencias bajas
+    const norm = Math.sqrt(norm1 * norm2);
+    if (norm > 0) {
+      correlations[lag] = sum / norm;
+    }
+  }
+
+  // Buscar primer pico significativo después del mínimo
+  let bestPeriod = -1;
+  let bestCorr = 0;
+  
+  // Buscar en rango de periodos válidos
+  for (let i = minPeriod + 1; i < maxPeriod; i++) {
+    // Es un pico si es mayor que sus vecinos
+    if (correlations[i] > correlations[i - 1] && 
+        correlations[i] > correlations[i + 1] &&
+        correlations[i] > correlations[bestPeriod] &&
+        correlations[i] > 0.5) { // Umbral mínimo de correlación
+      bestCorr = correlations[i];
+      bestPeriod = i;
+    }
+  }
+
+  // Refinamiento parabólico para mayor precisión
+  if (bestPeriod > minPeriod && bestPeriod < maxPeriod) {
+    const y0 = correlations[bestPeriod - 1];
+    const y1 = correlations[bestPeriod];
+    const y2 = correlations[bestPeriod + 1];
+    const ajuste = (y2 - y0) / (2 * (2 * y1 - y0 - y2));
+    bestPeriod = bestPeriod + ajuste;
+  }
+
+  if (bestPeriod > 0 && bestCorr > 0.5) {
+    return sampleRate / bestPeriod;
+  }
+
   return null;
 }
 
-// Detectar múltiples picos en el espectro FFT para identificar acordes
-function detectarPicos(analyser, sampleRate) {
+/**
+ * Suavizado temporal: promedia detecciones recientes con ponderación
+ */
+function temporalSmoothing(frequencies, newFreq, maxHistory = 5) {
+  if (!newFreq) {
+    // Si no hay nueva freq, devolver null si el buffer está vacío
+    return frequencies.length > 0 ? frequencies[frequencies.length - 1] : null;
+  }
+
+  const updated = [...frequencies, newFreq].slice(-maxHistory);
+  
+  // Promedio ponderado exponencial (más peso a recientes)
+  let pesoTotal = 0;
+  let sumaPonderada = 0;
+  updated.forEach((freq, i) => {
+    const peso = Math.pow(0.7, updated.length - 1 - i);
+    pesoTotal += peso;
+    sumaPonderada += freq * peso;
+  });
+
+  return pesoTotal > 0 ? sumaPonderada / pesoTotal : null;
+}
+
+/**
+ * Detectar pitch estables y filtrar armónicos
+ */
+function detectarPicos(analyser, sampleRate, historyRef) {
   const bufferLength = analyser.frequencyBinCount;
   const dataArray = new Uint8Array(bufferLength);
   analyser.getByteFrequencyData(dataArray);
 
-  const notas = new Set();
-  const umbral = 100;
+  const fftSize = analyser.fftSize;
+  const freqPerBin = sampleRate / fftSize;
+  
+  // Umbral adaptativo: 30% del máximo actual
+  const maxVal = Math.max(...dataArray);
+  const umbral = Math.max(30, maxVal * 0.3);
+  
   const minFreq = 60;
   const maxFreq = 1200;
+  const picos = [];
 
-  for (let i = 1; i < bufferLength - 1; i++) {
-    if (dataArray[i] > umbral &&
-        dataArray[i] > dataArray[i - 1] &&
-        dataArray[i] > dataArray[i + 1]) {
-      const freq = (i * sampleRate) / (analyser.fftSize * 2);
+  for (let i = 2; i < bufferLength - 2; i++) {
+    const val = dataArray[i];
+    const freq = i * freqPerBin;
+    
+    // Es un pico local
+    if (val > umbral &&
+        val >= dataArray[i - 1] && val >= dataArray[i - 2] &&
+        val >= dataArray[i + 1] && val >= dataArray[i + 2]) {
+      
       if (freq >= minFreq && freq <= maxFreq) {
-        const info = freqToNota(freq);
-        if (info) notas.add(info.nota);
+        // Filtrar armónicos: solo detectar fundamentales
+        // Un armónico tiene frecuencia = fundamental * n (n=2,3,4...)
+        const esArmonico = picos.some(pico => {
+          const ratio = freq / pico.freq;
+          // Si es múltiplo entero cercano (2, 3, 4...) y la potencia es menor
+          return (Math.abs(ratio - Math.round(ratio)) < 0.1) && 
+                 ratio > 1.5 && val < pico.val;
+        });
+        
+        if (!esArmonico) {
+          picos.push({ freq, val, bin: i });
+        }
       }
     }
   }
-  return [...notas];
+
+  // Ordenar por potencia (magnitud)
+  picos.sort((a, b) => b.val - a.val);
+
+  // Historial para estabilizar detección de acordes
+  if (historyRef) {
+    if (!historyRef.current.chordHistory) {
+      historyRef.current.chordHistory = [];
+    }
+    
+    const currentNotas = picos.slice(0, 6).map(p => {
+      const info = freqToNota(p.freq);
+      return info ? info.nota : null;
+    }).filter(Boolean);
+
+    if (currentNotas.length > 0) {
+      historyRef.current.chordHistory.push(currentNotas);
+      if (historyRef.current.chordHistory.length > 8) {
+        historyRef.current.chordHistory.shift();
+      }
+    }
+  }
+
+  return picos.slice(0, 6).map(p => freqToNota(p.freq)).filter(Boolean);
+}
+
+/**
+ * Estabilización de acorde: usar moda de historial
+ */
+function getEstableAcorde(historial) {
+  if (!historial || historial.length < 3) return null;
+  
+  // Tomar últimas detecciones
+  const recientes = historial.slice(-5);
+  const conteo = {};
+  
+  recientes.forEach(notas => {
+    const key = [...notas].sort().join('-');
+    conteo[key] = (conteo[key] || 0) + 1;
+  });
+
+  // Encontrar la combinación más frecuente
+  let mejorKey = null;
+  let mejorCount = 0;
+  
+  for (const [key, count] of Object.entries(conteo)) {
+    if (count > mejorCount) {
+      mejorCount = count;
+      mejorKey = key;
+    }
+  }
+
+  // Solo devolver si hay consenso (más de 50% de las veces)
+  if (mejorCount >= Math.ceil(recientes.length / 2)) {
+    return mejorKey.split('-');
+  }
+  
+  return null;
+}
+
+/**
+ * Convertir frecuencia a información de nota
+ */
+function freqToNota(freq) {
+  if (!freq || freq < 20) return null;
+  const A4 = 440;
+  const semitonos = 12 * Math.log2(freq / A4);
+  const semIndex = Math.round(semitonos);
+  const nota = NOTAS[((semIndex % 12) + 12 + 69) % 12];
+  const semIndexReal = Math.round(semitonos) + 69;
+  const octava = Math.floor(semIndexReal / 12) - 1;
+  const freqIdeal = A4 * Math.pow(2, (semIndexReal - 69) / 12);
+  const centsDiff = 1200 * Math.log2(freq / freqIdeal);
+  return { nota, octava, centsDiff, freqIdeal, freq, semIndex };
+}
+
+/**
+ * Encontrar la cuerda más cercana a la frecuencia detectada
+ */
+function encontrarCuerda(freq) {
+  if (!freq) return null;
+  
+  let mejor = null;
+  let menorDiff = Infinity;
+
+  for (const cuerda of CUERDAS_GUITARRA) {
+    const diff = Math.abs(cuerda.freq - freq);
+    if (diff < menorDiff) {
+      menorDiff = diff;
+      mejor = cuerda;
+    }
+  }
+
+  // Calcular cents de desviación
+  if (mejor) {
+    const centsOff = 1200 * Math.log2(freq / mejor.freq);
+    return {
+      ...mejor,
+      centsOff,
+      inTune: Math.abs(centsOff) < 5, // 5 cents de tolerancia
+      almostInTune: Math.abs(centsOff) < 15
+    };
+  }
+  
+  return null;
 }
 
 function identificarAcorde(notas) {
-  if (notas.length < 2) return null;
+  if (!notas || notas.length < 2) return null;
 
   const notaIndices = notas.map(n => NOTAS.indexOf(n)).filter(i => i >= 0);
+  if (notaIndices.length < 2) return null;
 
   for (const raiz of notaIndices) {
     const nombreRaiz = NOTAS[raiz];
@@ -86,7 +289,10 @@ function identificarAcorde(notas) {
       const notasAcorde = intervalos.map(i => (raiz + i) % 12);
       const todas = notasAcorde.every(n => notaIndices.includes(n));
       if (todas) {
-        const sufijo = tipo === 'Mayor' ? '' : tipo === 'Menor' ? 'm' : tipo === 'Séptima' ? '7' : tipo === 'Menor7' ? 'm7' : '5';
+        const sufijo = tipo === 'Mayor' ? '' : 
+                      tipo === 'Menor' ? 'm' : 
+                      tipo === 'Séptima' ? '7' : 
+                      tipo === 'Menor7' ? 'm7' : '5';
         return { nombre: `${nombreRaiz}${sufijo}`, tipo, raiz: nombreRaiz };
       }
     }
@@ -108,76 +314,200 @@ export default function Afinador() {
 
   // Acordes
   const [notasDetectadas, setNotasDetectadas] = useState([]);
-  const [acorDeDetectado, setAcorDeDetectado] = useState(null);
+  const [acordeDetectado, setAcordeDetectado] = useState(null);
 
+  // Refs para audio
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const streamRef = useRef(null);
   const rafRef = useRef(null);
+  
+  // Refs para estabilización
+  const freqHistoryRef = useRef([]);
+  const lastUpdateRef = useRef(0);
+  const chordHistoryRef = useRef({ chordHistory: [] });
+  const lastChordUpdateRef = useRef(0);
+  const stableFreqRef = useRef(null);
+  const consecutiveFramesRef = useRef(0);
+
+  // Throttle: mínimo 50ms entre actualizaciones de afinador
+  const THROTTLE_AFINADOR = 50;
+  // Throttle: mínimo 150ms entre actualizaciones de acordes
+  const THROTTLE_ACORDES = 150;
 
   const iniciar = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    streamRef.current = stream;
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    audioCtxRef.current = ctx;
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 4096;
-    analyserRef.current = analyser;
-    const source = ctx.createMediaStreamSource(stream);
-    source.connect(analyser);
-    setActivo(true);
-    loop(analyser, ctx.sampleRate);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true,
+        },
+        video: false 
+      });
+      streamRef.current = stream;
+      
+      // Reutilizar AudioContext existente o crear nuevo
+      let ctx = audioCtxRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        audioCtxRef.current = ctx;
+      }
+      
+      // Si estaba suspendido, reanudar
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.3;
+      analyserRef.current = analyser;
+      
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(analyser);
+      
+      // Resetear historial
+      freqHistoryRef.current = [];
+      chordHistoryRef.current = { chordHistory: [] };
+      stableFreqRef.current = null;
+      consecutiveFramesRef.current = 0;
+      
+      setActivo(true);
+      loop();
+    } catch (err) {
+      console.error('Error al iniciar micrófono:', err);
+      setActivo(false);
+    }
   };
 
   const detener = () => {
     cancelAnimationFrame(rafRef.current);
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    audioCtxRef.current?.close();
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    
+    // No cerrar AudioContext para poder reutilizarlo
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      // Mantener abierto para reutilización
+    }
+    
     setActivo(false);
     setFrecuencia(null);
     setNotaInfo(null);
     setCuerdaDetectada(null);
     setNotasDetectadas([]);
-    setAcorDeDetectado(null);
+    setAcordeDetectado(null);
+    
+    // Limpiar refs
+    freqHistoryRef.current = [];
+    chordHistoryRef.current = { chordHistory: [] };
+    stableFreqRef.current = null;
+    consecutiveFramesRef.current = 0;
   };
 
-  const loop = (analyser, sampleRate) => {
+  const loop = useCallback(() => {
+    const analyser = analyserRef.current;
+    const ctx = audioCtxRef.current;
+    
+    if (!analyser || !ctx) {
+      rafRef.current = requestAnimationFrame(loop);
+      return;
+    }
+    
+    const sampleRate = ctx.sampleRate;
     const buffer = new Float32Array(analyser.fftSize);
-    const tick = () => {
-      analyser.getFloatTimeDomainData(buffer);
-
-      if (modo === 'afinador' || true) {
-        const freq = detectarFrecuencia(buffer, sampleRate);
-        if (freq) {
-          setFrecuencia(freq);
-          const info = freqToNota(freq);
-          setNotaInfo(info);
-          if (info) {
-            const closest = CUERDAS_GUITARRA.reduce((prev, curr) =>
-              Math.abs(curr.freq - freq) < Math.abs(prev.freq - freq) ? curr : prev
-            );
-            if (Math.abs(closest.freq - freq) < 20) setCuerdaDetectada(closest);
-            else setCuerdaDetectada(null);
+    analyser.getFloatTimeDomainData(buffer);
+    
+    const ahora = performance.now();
+    
+    // ── Procesamiento de AFINADOR ──
+    if (ahora - lastUpdateRef.current >= THROTTLE_AFINADOR) {
+      const rawFreq = detectarFrecuencia(buffer, sampleRate);
+      
+      if (rawFreq) {
+        consecutiveFramesRef.current++;
+        
+        // Solo promediar si tenemos suficientes frames consecutivos
+        if (consecutiveFramesRef.current >= 2) {
+          const smoothedFreq = temporalSmoothing(
+            freqHistoryRef.current,
+            rawFreq,
+            5
+          );
+          
+          if (smoothedFreq) {
+            stableFreqRef.current = smoothedFreq;
+            
+            setFrecuencia(smoothedFreq);
+            const info = freqToNota(smoothedFreq);
+            setNotaInfo(info);
+            
+            if (info) {
+              const cuerda = encontrarCuerda(smoothedFreq);
+              setCuerdaDetectada(cuerda);
+            }
           }
         }
-      }
-
-      // Detección de acordes
-      const picos = detectarPicos(analyser, sampleRate);
-      setNotasDetectadas(picos);
-      if (picos.length >= 2) {
-        const acorde = identificarAcorde(picos);
-        setAcorDeDetectado(acorde);
       } else {
-        setAcorDeDetectado(null);
+        // Sin detección - decrementar contador
+        consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 2);
+        
+        // Mantener última frecuencia válida por un tiempo
+        if (stableFreqRef.current && consecutiveFramesRef.current === 0) {
+          // Ya no mostrar nada después de varios frames sin detección
+        }
       }
+      
+      lastUpdateRef.current = ahora;
+    }
+    
+    // ── Procesamiento de ACORDES ──
+    if (ahora - lastChordUpdateRef.current >= THROTTLE_ACORDES) {
+      const picos = detectarPicos(analyser, sampleRate, chordHistoryRef);
+      const notas = picos.map(p => p.nota);
+      
+      setNotasDetectadas(notas);
+      
+      if (notas.length >= 2) {
+        const historial = chordHistoryRef.current.chordHistory;
+        const estableNotas = getEstableAcorde(historial);
+        
+        if (estableNotas) {
+          const acorde = identificarAcorde(estableNotas);
+          if (acorde) {
+            setAcordeDetectado(acorde);
+          }
+        }
+      } else {
+        setAcordeDetectado(null);
+      }
+      
+      lastChordUpdateRef.current = ahora;
+    }
+    
+    rafRef.current = requestAnimationFrame(loop);
+  }, []);
 
-      rafRef.current = requestAnimationFrame(tick);
+  useEffect(() => {
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+      }
     };
-    rafRef.current = requestAnimationFrame(tick);
-  };
+  }, []);
 
-  useEffect(() => () => detener(), []);
+  // Iniciar/parar loop cuando cambia activo
+  useEffect(() => {
+    if (activo) {
+      rafRef.current = requestAnimationFrame(loop);
+    } else {
+      cancelAnimationFrame(rafRef.current);
+    }
+  }, [activo, loop]);
 
   const pedirConsejo = async () => {
     if (!notaInfo) return;
@@ -306,10 +636,10 @@ Da un consejo corto y práctico (1-2 oraciones) en español sobre cómo afinar c
         <>
           {/* Display acorde */}
           <div className="w-full bg-card border border-border/60 rounded-3xl p-6 mb-5 text-center">
-            {acorDeDetectado ? (
+            {acordeDetectado ? (
               <>
-                <div className="text-7xl font-black text-primary mb-2">{acorDeDetectado.nombre}</div>
-                <p className="text-muted-foreground text-sm mb-1">Tipo: {acorDeDetectado.tipo}</p>
+                <div className="text-7xl font-black text-primary mb-2">{acordeDetectado.nombre}</div>
+                <p className="text-muted-foreground text-sm mb-1">Tipo: {acordeDetectado.tipo}</p>
                 <div className="inline-flex items-center gap-2 bg-green-400/20 text-green-400 px-4 py-1.5 rounded-full text-sm font-semibold">
                   ✅ Acorde detectado
                 </div>
